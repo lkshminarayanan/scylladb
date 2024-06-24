@@ -167,6 +167,7 @@ private:
     trust_promoted_index _trust_pi;
     std::optional<column_values_fixed_lengths> _ck_values_fixed_lengths;
     tracing::trace_state_ptr _trace_state;
+    const abort_source& _abort;
 
     inline bool is_mc_format() const { return static_cast<bool>(_ck_values_fixed_lengths); }
 
@@ -185,6 +186,12 @@ public:
     }
 
     processing_result process_state(temporary_buffer<char>& data) {
+        if (_abort.abort_requested()) {
+            auto ex = _abort.abort_requested_exception_ptr();
+            sstlog.warn("aborting index_consume_entry_context::process_state() : {}", ex);
+            std::rethrow_exception(ex);
+        }
+
         auto current_pos = [&] { return this->position() - data.size(); };
         auto read_vint_or_uint64 = [this] (temporary_buffer<char>& data) {
             return is_mc_format() ? this->read_unsigned_vint(data) : this->read_64(data);
@@ -323,6 +330,7 @@ public:
         , _sst(sst), _consumer(consumer), _entry_offset(start), _trust_pi(trust_pi)
         , _ck_values_fixed_lengths(std::move(ck_values_fixed_lengths))
         , _trace_state(std::move(trace_state))
+        , _abort(sst.manager().get_abort_source())
     {}
 };
 
