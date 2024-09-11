@@ -68,6 +68,8 @@ add_scylla_test(commitlog_test
   KIND SEASTAR)
 add_scylla_test(compaction_group_test
   KIND SEASTAR)
+add_scylla_test(comparable_bytes_test
+  KIND SEASTAR)
 add_scylla_test(compound_test
   KIND SEASTAR)
 add_scylla_test(compress_test
