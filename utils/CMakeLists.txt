@@ -15,6 +15,7 @@ target_sources(utils
     bloom_filter.cc
     buffer_input_stream.cc
     build_id.cc
+    comparable_bytes.cc
     config_file.cc
     directories.cc
     disk-error-handler.cc
