@@ -10,8 +10,16 @@
 
 #include "concrete_types.hh"
 
+constexpr uint8_t BYTE_MSB_MASK = (1 << 7);
+
 struct comparable_bytes_size_visitor {
     int serialized_bytes_size;
+
+    template <typename T>
+    size_t operator()(const integer_type_impl<T>&) {
+        // Only first bit is inverted for integer types, so the length remains the same
+        return serialized_bytes_size;
+    }
 
     // TODO: Handle other types
 
@@ -30,6 +38,16 @@ static size_t comparable_bytes_size(const abstract_type& type, managed_bytes_vie
 struct to_comparable_bytes_visitor {
     managed_bytes_view regular_bytes_view;
     comparable_bytes& comparable_bytes;
+
+    // Fixed length signed integers encoding;
+    // Invert the first bit so that negative numbers are ordered before the positive ones
+    template <typename T>
+    void operator()(const integer_type_impl<T>&) {
+        managed_bytes_mutable_view comparable_bytes_view(comparable_bytes);
+        write_fragmented(comparable_bytes_view, regular_bytes_view);
+        // invert msb of the first byte in the comparable bytes
+        comparable_bytes[0] ^= BYTE_MSB_MASK;
+    }
 
     // TODO: Handle other types
 
@@ -56,6 +74,12 @@ comparable_bytes_opt comparable_bytes::from_data_value(const data_value& value) 
 struct decoded_bytes_size_visitor {
     const comparable_bytes& cb;
 
+    template <typename T>
+    size_t operator()(const integer_type_impl<T>&) {
+        // Only first bit is inverted for integer types, so the length remains the same
+        return cb.size();
+    }
+
     // TODO: Handle other types
 
     size_t operator()(const abstract_type&) {
@@ -73,6 +97,15 @@ static size_t decoded_bytes_size(const abstract_type& type, const comparable_byt
 struct from_comparable_bytes_visitor {
     managed_bytes_view comparable_bytes_view;
     managed_bytes& decoded_bytes;
+
+    // First bit is inverted for the fixed length signed integers.
+    template <typename T>
+    void operator()(const integer_type_impl<T>&) {
+        managed_bytes_mutable_view decoded_bytes_view(decoded_bytes);
+        write_fragmented(decoded_bytes_view, comparable_bytes_view);
+        // invert msb of the first byte in the decoded bytes
+        decoded_bytes[0] ^= BYTE_MSB_MASK;
+    }
 
     // TODO: Handle other types
 
