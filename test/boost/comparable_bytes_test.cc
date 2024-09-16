@@ -59,3 +59,38 @@ BOOST_AUTO_TEST_CASE(test_comparable_bytes_integer_types) {
     integer_types_test<int16_t>();  // smallint
     integer_types_test<int32_t>();  // int
 }
+
+BOOST_AUTO_TEST_CASE(test_byte_comparable_view_integer_types) {
+    using int_type = int32_t;
+    std::random_device rd;
+    auto seed = rd();
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<> dist(std::numeric_limits<int_type>::min(), std::numeric_limits<int_type>::max());
+    const int NUM_OF_ITEMS = 1000;
+
+    struct test_item {
+        int_type value;
+        managed_bytes mb;
+    };
+    std::vector<test_item> items;
+    items.reserve(NUM_OF_ITEMS);
+
+    for (int i = 0; i < NUM_OF_ITEMS; i++) {
+        int_type num = dist(gen);
+        data_value dv(num);
+
+        // collect them in a vector to verify ordering
+        items.emplace_back(num, managed_bytes(dv.serialize_nonnull()));
+    }
+
+    // Sort the items based on byte_comparable_view
+    std::ranges::sort(items, [](test_item a, test_item b) {
+        // Not optimal - just to demonstrate how this works.
+        return byte_comparable_view::from_managed_bytes(*int32_type, a.mb) < byte_comparable_view::from_managed_bytes(*int32_type, b.mb);
+    });
+
+    // Verify that ordering them based on comparable bytes, sorts the values.
+    BOOST_REQUIRE_MESSAGE(std::ranges::is_sorted(items, [](const test_item& a, const test_item& b) {
+        return a.value < b.value;
+    }), fmt::format("sorting items based on byte_comparable_view failed. seed used : {}", seed));
+}

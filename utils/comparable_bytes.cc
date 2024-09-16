@@ -134,3 +134,99 @@ data_value comparable_bytes::to_data_value(const data_type& type) {
 
     return type->deserialize(decoded_bytes.value());
 }
+
+/*
+ * Alternative approach : extend comparable bytes as a view
+ */
+
+int64_t byte_comparable_view::consume_next_byte() {
+    if (empty()) {
+        SCYLLA_ASSERT(false);
+        return END_OF_STREAM;
+    }
+
+    uint8_t value = current_fragment().at(_curr_fragment_read_pos);
+
+    // move read index; remove current fragment if it has been read;
+    _curr_fragment_read_pos++;
+    if (_curr_fragment_read_pos == current_fragment().size()) {
+        remove_current();
+        _curr_fragment_read_pos = 0;
+    }
+
+    return value;
+}
+
+// Fixed length signed integers encoding;
+// Invert the first bit so that negative numbers are ordered before the positive ones
+class byte_comparable_view_fixed_length_signed_integer : public byte_comparable_view {
+    bool _sign_bit_sent{false};
+public:
+    byte_comparable_view_fixed_length_signed_integer(const managed_bytes& mb) : byte_comparable_view(mb) {}
+
+    int64_t next() override {
+        if (empty()) {
+            return END_OF_STREAM;
+        }
+
+        int64_t value = consume_next_byte();
+        if (!_sign_bit_sent) {
+            // Invert the sign bit
+            value ^= BYTE_MSB_MASK;
+            _sign_bit_sent = true;
+        }
+        return value;
+    }
+};
+
+struct to_byte_comparable_view_visitor {
+    const managed_bytes& regular_bytes;
+
+    template <typename T>
+    byte_comparable_view_ptr operator()(const integer_type_impl<T>&) {
+        return std::make_unique<byte_comparable_view_fixed_length_signed_integer>(regular_bytes);
+    }
+
+    // TODO: Handle other types
+
+    byte_comparable_view_ptr operator()(const abstract_type&) {
+        // Unimplemented
+        SCYLLA_ASSERT(false);
+        return nullptr;
+    }
+};
+
+byte_comparable_view_ptr byte_comparable_view::from_managed_bytes(const abstract_type& type, const managed_bytes_opt& mb) {
+    if (!mb) {
+        return nullptr;
+    }
+
+    return visit(type, to_byte_comparable_view_visitor{mb.value()});
+}
+
+std::strong_ordering byte_comparable_view::operator<=>(byte_comparable_view& other) {
+    while (true) {
+        int64_t b1 = next();
+        auto cmp = b1 <=> other.next();
+        if (cmp != std::strong_ordering::equal) {
+            return cmp;
+        }
+        if (b1 == END_OF_STREAM) {
+            // both bytes are equal and end of stream
+            return std::strong_ordering::equal;
+        }
+    }
+}
+
+std::strong_ordering operator<=>(const byte_comparable_view_ptr& bytes1, const byte_comparable_view_ptr& bytes2) {
+    if (bytes1 && bytes2) {
+        return *bytes1 <=> *bytes2;
+    } else if (!bytes1 && bytes2) {
+        // nullptr is ordered first
+        return std::strong_ordering::less;
+    } else if (bytes1 && !bytes2) {
+        return std::strong_ordering::greater;
+    } else {
+        return std::strong_ordering::equal;
+    }
+ }
