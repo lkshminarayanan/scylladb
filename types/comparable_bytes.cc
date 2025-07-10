@@ -36,6 +36,13 @@ static constexpr uint8_t ESCAPE = 0x00;
 static constexpr uint8_t ESCAPED_0_CONT = 0xFE;
 static constexpr uint8_t ESCAPED_0_DONE = 0xFF;
 
+// Next component marker.
+static constexpr uint8_t NEXT_COMPONENT = 0x40;
+// Marker for null components in tuples, maps, sets and clustering keys.
+static constexpr uint8_t NEXT_COMPONENT_NULL = 0x3E;
+// Terminator byte in sequences.
+static constexpr uint8_t TERMINATOR = 0x38;
+
 static void read_fragmented_checked(managed_bytes_view& view, size_t bytes_to_read, bytes::value_type* out) {
     if (view.size_bytes() < bytes_to_read) {
         throw_with_backtrace<marshal_exception>(
@@ -855,6 +862,43 @@ static void unescape_zeros(managed_bytes_view& comparable_bytes_view, bytes_ostr
     }
 }
 
+// Forward declaration of functions to encode and decode a single component values.
+// They are defined later in the file as they depend on to_comparable_bytes_visitor and from_comparable_bytes_visitor.
+static void encode_component_nonnull(const abstract_type& type, managed_bytes_view serialized_bytes_view, bytes_ostream& out);
+static void decode_component_nonnull(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out);
+
+// Encodes a single element of a multi-component type into a byte-comparable format.
+// Refer encode_component_nonnull() for the encoding of non-null elements.
+// If the element is null, it is encoded with a `NEXT_COMPONENT_NULL` marker.
+void encode_component(const abstract_type& type, managed_bytes_view_opt serialized_bytes_view_opt, bytes_ostream& out) {
+    if (serialized_bytes_view_opt.has_value()) {
+        encode_component_nonnull(type, serialized_bytes_view_opt.value(), out);
+    } else {
+        write_native_int(out, NEXT_COMPONENT_NULL);
+    }
+}
+
+// Decodes a single element of a multi-component type from byte-comparable format into serialized format.
+stop_iteration decode_component(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out) {
+    auto next_component_marker = read_simple_native<uint8_t>(comparable_bytes_view);
+    switch (next_component_marker) {
+        [[likely]] case NEXT_COMPONENT:
+            decode_component_nonnull(type, comparable_bytes_view, out);
+            return stop_iteration::no;
+        case NEXT_COMPONENT_NULL:
+            // Write -1 as length for null value
+            write_be(reinterpret_cast<char*>(out.write_place_holder(sizeof(int32_t))), int32_t(-1));
+            return stop_iteration::no;
+        case TERMINATOR:
+            // End of the collection, return without writing anything
+            return stop_iteration::yes;
+        default:
+            // This should never happen, but just in case
+            SCYLLA_ASSERT(false);
+            return stop_iteration::yes;
+    }
+}
+
 // to_comparable_bytes_visitor provides methods to
 // convert serialized bytes into byte comparable format.
 struct to_comparable_bytes_visitor {
@@ -938,6 +982,15 @@ struct to_comparable_bytes_visitor {
         on_internal_error(cblogger, fmt::format("byte comparable format not supported for type {}", type.name()));
     }
 };
+
+// Encodes a single non-null element of a multi-component type into a byte-comparable format.
+// The element can be an item from a list, set, vector, a key or value from a map, or a field from a tuple.
+// The serialized bytes of the element are transformed into a byte-comparable representation,
+// prefixed with a `NEXT_COMPONENT` marker to delimit it from other elements, and written to the output stream.
+void encode_component_nonnull(const abstract_type& type, managed_bytes_view serialized_bytes_view, bytes_ostream& out) {
+    write_native_int(out, NEXT_COMPONENT);
+    visit(type, to_comparable_bytes_visitor{serialized_bytes_view, out});
+}
 
 comparable_bytes::comparable_bytes(const abstract_type& type, managed_bytes_view serialized_bytes_view) {
     bytes_ostream encoded_bytes_ostream;
@@ -1034,6 +1087,17 @@ struct from_comparable_bytes_visitor {
         on_internal_error(cblogger, fmt::format("byte comparable format not supported for type {}", type.name()));
     }
 };
+
+// Decodes a single non-null element of a multi-component type from byte-comparable format into serialized format.
+void decode_component_nonnull(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out) {
+    // Placeholder to write the size of the serialized bytes
+    auto element_size_ptr = reinterpret_cast<char*>(out.write_place_holder(sizeof(int32_t)));
+    auto curr_write_pos = out.pos();
+    // Decode the comparable bytes into serialized bytes and write it into out
+    visit(type, from_comparable_bytes_visitor{comparable_bytes_view, out});
+    // Now write the size of the serialized bytes in big endian format
+    write_be(element_size_ptr, static_cast<int32_t>(out.written_since(curr_write_pos)));
+}
 
 managed_bytes_opt comparable_bytes::to_serialized_bytes(const abstract_type& type) const {
     if (_encoded_bytes.empty()) {
