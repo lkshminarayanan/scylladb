@@ -13,7 +13,10 @@
 
 #include "bytes_ostream.hh"
 #include "concrete_types.hh"
+#include "types/collection.hh"
+#include "types/listlike_partial_deserializing_iterator.hh"
 #include "types/types.hh"
+#include "utils/managed_bytes.hh"
 #include "utils/multiprecision_int.hh"
 
 logging::logger cblogger("comparable_bytes");
@@ -35,6 +38,15 @@ static constexpr uint8_t ESCAPE = 0x00;
 // so zeroed spaces only grow by 1 byte
 static constexpr uint8_t ESCAPED_0_CONT = 0xFE;
 static constexpr uint8_t ESCAPED_0_DONE = 0xFF;
+
+// Next component marker.
+static constexpr uint8_t NEXT_COMPONENT = 0x40;
+// Marker for null components in tuples, maps, sets and clustering keys.
+static constexpr uint8_t NEXT_COMPONENT_NULL = 0x3E;
+// Default terminator byte in sequences.
+// Smaller than NEXT_COMPONENT_NULL, but larger than LT_NEXT_COMPONENT to
+// ensure lexicographic compares go in the correct direction
+static constexpr uint8_t TERMINATOR = 0x38;
 
 static void read_fragmented_checked(managed_bytes_view& view, size_t bytes_to_read, bytes::value_type* out) {
     if (view.size_bytes() < bytes_to_read) {
@@ -855,6 +867,38 @@ static void unescape_zeros(managed_bytes_view& comparable_bytes_view, bytes_ostr
     }
 }
 
+// Forward declaration of functions to encode and decode a single component value from a multi-component data types like map, set, list, tuples, UDTs.
+// They are defined later in the file as they depend on to_comparable_bytes_visitor and from_comparable_bytes_visitor.
+void encode_component(const abstract_type& type, managed_bytes_view_opt&& serialized_bytes_view, bytes_ostream& out);
+stop_iteration decode_component(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out);
+
+// Encode set or list type into byte comparable format.
+// The collection is encoded as a sequence of elements, each preceded by a component header.
+// The component header is either NEXT_COMPONENT_NULL or NEXT_COMPONENT, depending on whether the element is null or not.
+// The collection is terminated with a TERMINATOR byte.
+void encode_set_or_list_type(const listlike_collection_type_impl& type, managed_bytes_view& serialized_bytes_view, bytes_ostream& out) {
+    const auto elements_type = *type.get_elements_type();
+    const auto collection_size = read_collection_size(serialized_bytes_view);
+    for (int i = 0; i < collection_size; ++i) {
+        // Read the serialized bytes from the collection value and write it in byte comparable format.
+        encode_component(elements_type, read_collection_value(serialized_bytes_view), out);
+    }
+    write_native_int(out, TERMINATOR);
+}
+
+// Decode set or list type from byte comparable format.
+void decode_set_or_list_type(const listlike_collection_type_impl& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out) {
+    const auto elements_type = *type.get_elements_type();
+    // Create a place holder for the size of the collection.
+    // The size will be written later after decoding all the elements.
+    auto collection_size_ptr = reinterpret_cast<char*>(out.write_place_holder(sizeof(int32_t)));
+    int32_t collection_size = 0;
+    while (decode_component(elements_type, comparable_bytes_view, out) == stop_iteration::no) {
+        collection_size++;
+    }
+    write_be(collection_size_ptr, collection_size);
+}
+
 // to_comparable_bytes_visitor provides methods to
 // convert serialized bytes into byte comparable format.
 struct to_comparable_bytes_visitor {
@@ -931,6 +975,11 @@ struct to_comparable_bytes_visitor {
         escape_zeros(serialized_bytes_view, out);
     }
 
+    // encode sets and lists
+    void operator()(const listlike_collection_type_impl& type) {
+        encode_set_or_list_type(type, serialized_bytes_view, out);
+    }
+
     // TODO: Handle other types
 
     void operator()(const abstract_type& type) {
@@ -938,6 +987,19 @@ struct to_comparable_bytes_visitor {
         on_internal_error(cblogger, fmt::format("byte comparable format not supported for type {}", type.name()));
     }
 };
+
+// Encode a single value of a multi-component data type (list, set, map, tuple, UDT)
+// into byte comparable format and write it into the given out bytes_stream.
+void encode_component(const abstract_type& type, managed_bytes_view_opt&& serialized_bytes_view, bytes_ostream& out) {
+    if (serialized_bytes_view.has_value()) {
+        // Write the NEXT_COMPONENT header for non-null elements and then encode the element itself.
+        write_native_int(out, NEXT_COMPONENT);
+        visit(type, to_comparable_bytes_visitor{serialized_bytes_view.value(), out});
+    } else {
+        // Write the NEXT_COMPONENT_NULL header for null elements.
+        write_native_int(out, NEXT_COMPONENT_NULL);
+    }
+}
 
 comparable_bytes::comparable_bytes(const abstract_type& type, managed_bytes_view serialized_bytes_view) {
     bytes_ostream encoded_bytes_ostream;
@@ -1027,6 +1089,11 @@ struct from_comparable_bytes_visitor {
         unescape_zeros(comparable_bytes_view, out);
     }
 
+    // decode sets and lists
+    void operator()(const listlike_collection_type_impl& type) {
+        decode_set_or_list_type(type, comparable_bytes_view, out);
+    }
+
     // TODO: Handle other types
 
     void operator()(const abstract_type& type) {
@@ -1034,6 +1101,34 @@ struct from_comparable_bytes_visitor {
         on_internal_error(cblogger, fmt::format("byte comparable format not supported for type {}", type.name()));
     }
 };
+
+stop_iteration decode_component(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out) {
+    auto next_component_marker = read_simple_native<uint8_t>(comparable_bytes_view);
+    switch (next_component_marker) {
+        case NEXT_COMPONENT:
+        {
+            // Placeholder to write the size of the serialized bytes
+            auto element_size_ptr = reinterpret_cast<char*>(out.write_place_holder(sizeof(int32_t)));
+            auto curr_write_pos = out.pos();
+            // Decode the comparable bytes into serialized bytes and write it into out
+            visit(type, from_comparable_bytes_visitor{comparable_bytes_view, out});
+            // Now write the size of the serialized bytes in big endian format
+            write_be(element_size_ptr, out.written_since(curr_write_pos));
+            return stop_iteration::no;
+        }
+        case NEXT_COMPONENT_NULL:
+            // Write -1 as length for null value
+            write_be(reinterpret_cast<char*>(out.write_place_holder(sizeof(int32_t))), int32_t(-1));
+            return stop_iteration::no;
+        case TERMINATOR:
+            // End of the collection, return without writing anything
+            return stop_iteration::yes;
+    }
+
+    // This should never happen, but just in case
+    SCYLLA_ASSERT(false);
+    return stop_iteration::yes;
+}
 
 managed_bytes_opt comparable_bytes::to_serialized_bytes(const abstract_type& type) const {
     if (_encoded_bytes.empty()) {

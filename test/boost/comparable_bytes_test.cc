@@ -15,12 +15,15 @@
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/sstable_test_env.hh"
+#include "types/list.hh"
+#include "types/set.hh"
 #include "types/types.hh"
 #include "types/comparable_bytes.hh"
 #include "utils/big_decimal.hh"
 #include "utils/multiprecision_int.hh"
 #include "utils/UUID.hh"
 #include "utils/UUID_gen.hh"
+
 
 BOOST_AUTO_TEST_CASE(test_comparable_bytes_opt) {
     BOOST_REQUIRE(comparable_bytes::from_data_value(data_value::make_null(int32_type)) == comparable_bytes_opt());
@@ -515,6 +518,92 @@ BOOST_AUTO_TEST_CASE(test_inet) {
     }
 
     byte_comparable_test(std::move(test_data));
+}
+
+extern void encode_component(const abstract_type& type, managed_bytes_view_opt&& serialized_bytes_view, bytes_ostream& out);
+extern stop_iteration decode_component(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out);
+BOOST_AUTO_TEST_CASE(test_encode_decode_component) {
+    // Verify NULL encode and decode works
+    bytes_ostream out;
+    data_value null_int = data_value::make_null(int32_type);
+    encode_component(*int32_type, managed_bytes_view_opt(null_int.serialize()), out);
+    auto comparable_bytes = std::move(out).to_managed_bytes();
+    auto comparable_bytes_view = managed_bytes_view(comparable_bytes);
+    // encoded bytes should just have a NEXT_COMPONENT_NULL marker
+    constexpr uint8_t NEXT_COMPONENT_NULL = 0x3E;
+    BOOST_REQUIRE_EQUAL(comparable_bytes_view.size(), sizeof(uint8_t));
+    BOOST_REQUIRE_EQUAL(comparable_bytes_view[0], NEXT_COMPONENT_NULL);
+    out.clear();
+    BOOST_REQUIRE_EQUAL(decode_component(*int32_type, comparable_bytes_view, out), stop_iteration::no);
+    auto decoded_bytes = std::move(out).to_managed_bytes();
+    // decoded bytes will have size as -1 for null components
+    BOOST_REQUIRE_EQUAL(decoded_bytes.size(), sizeof(int32_t));
+    BOOST_REQUIRE_EQUAL(int32_t(decoded_bytes[0]), -1);
+
+    // Verify non-null encode and decode works
+    constexpr uint8_t NEXT_COMPONENT = 0x40;
+    const auto mp_int = utils::multiprecision_int("123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890");
+    for (const auto& test_value : {
+        data_value(tests::random::get_int<int32_t>()),
+        data_value(tests::random::get_int<int64_t>()),
+        data_value(tests::random::get_real<double>()),
+        data_value(mp_int),
+        data_value(big_decimal(tests::random::get_int<int32_t>(), mp_int)),
+        data_value(utils::UUID_gen::get_name_UUID(tests::random::get_sstring(10))),
+        data_value(tests::random::get_bytes()),
+    }) {
+        const auto& type = *test_value.type();
+        out.clear();
+        encode_component(type, managed_bytes_view_opt(test_value.serialize_nonnull()), out);
+        auto comparable_bytes = std::move(out).to_managed_bytes();
+        auto comparable_bytes_view = managed_bytes_view(comparable_bytes);
+        // encoded component should begin with a NEXT_COMPONENT marker
+        BOOST_REQUIRE_EQUAL(comparable_bytes_view[0], NEXT_COMPONENT);
+        out.clear();
+        BOOST_REQUIRE_EQUAL(decode_component(type, comparable_bytes_view, out), stop_iteration::no);
+        auto decoded_bytes = std::move(out).to_managed_bytes();
+        auto decoded_bytes_view = managed_bytes_view(decoded_bytes);
+        // decoded bytes should match the serialized form
+        BOOST_REQUIRE_EQUAL(read_simple<int32_t>(decoded_bytes_view), test_value.serialized_size());
+        BOOST_REQUIRE(type.deserialize(managed_bytes_view(decoded_bytes_view)) == test_value);
+    }
+
+    // Check if decode handles terminator correctly
+    constexpr uint8_t TERMINATOR = 0x38;
+    out.write(bytes_view(reinterpret_cast<const signed char*>(&TERMINATOR), sizeof(TERMINATOR)));
+    comparable_bytes = std::move(out).to_managed_bytes();
+    comparable_bytes_view = managed_bytes_view(comparable_bytes);
+    out.clear();
+    BOOST_REQUIRE_EQUAL(decode_component(*int32_type, comparable_bytes_view, out), stop_iteration::yes);
+    BOOST_REQUIRE(out.empty());
+}
+
+static std::string print_hexa(managed_bytes_view mbv) {
+    std::string txt = "";
+    while (!mbv.empty()) {
+        txt += fmt::format("{:02X}", uint8_t(mbv[0])) + " ";
+        mbv.remove_prefix(1);
+    }
+
+    return txt;
+}
+
+BOOST_AUTO_TEST_CASE(test_set) {
+    // Note that set test data might have duplicates and is not sorted but that is okay as we just test how the data is encoded.
+    auto byte_set = make_set_value(set_type_impl::get_instance(byte_type, false), generate_integer_test_data<int8_t>());
+    testlog.info("byte set : {}; {}", byte_set, byte_set.type()->cql3_type_name());
+    auto cb = comparable_bytes::from_data_value(byte_set);
+    testlog.info("comparable bytes : {}", print_hexa(cb->as_managed_bytes_view()));
+}
+
+BOOST_AUTO_TEST_CASE(test_list) {
+    std::vector<data_value> dv = generate_integer_test_data<int8_t>();
+    // std::vector<data_value> dv;
+    dv.push_back(data_value(int8_t(-64)));
+    auto byte_list = make_list_value(list_type_impl::get_instance(byte_type, false), dv);
+    testlog.info("byte set : {}; {}", byte_list, byte_list.type()->cql3_type_name());
+    auto cb = comparable_bytes::from_data_value(byte_list);
+    testlog.info("comparable bytes : {}", print_hexa(cb->as_managed_bytes_view()));
 }
 
 // Test Scylla's byte-comparable encoding compatibility with Cassandra's implementation by
