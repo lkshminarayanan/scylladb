@@ -10,11 +10,14 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ipv4_address.hh>
 #include <seastar/util/lazy.hh>
+#include <vector>
 
 #include "bytes_ostream.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/sstable_test_env.hh"
+#include "types/list.hh"
+#include "types/set.hh"
 #include "types/types.hh"
 #include "types/comparable_bytes.hh"
 #include "utils/big_decimal.hh"
@@ -575,6 +578,62 @@ BOOST_AUTO_TEST_CASE(test_encode_decode_component) {
     out.clear();
     BOOST_REQUIRE_EQUAL(decode_component(*int32_type, comparable_bytes_view, out), stop_iteration::yes);
     BOOST_REQUIRE(out.empty());
+}
+
+// Common test method for lists and sets. Note that a set is expected to be sorted and unique, but it doesn't
+// matter during tests, as both lists and sets internally use the same underlying implementation based on vectors.
+static void test_list_or_set(const std::function<data_type(data_type, bool)>& get_collection_type,
+                             const std::function<data_value(data_type, std::vector<data_value>)>& make_collection_value) {
+    // Returns a vector of vectors of data_value, where each inner vector represents a collection of data_values.
+    auto generate_test_data = [] (const std::function<data_value()>& create_data_value) {
+        constexpr size_t test_data_size = 500, max_list_size = 25;
+        std::vector<std::vector<data_value>> test_data;
+        test_data.reserve(test_data_size + 1);
+        for (size_t i = 0; i < test_data_size; i++) {
+            size_t list_size = tests::random::get_int<size_t>(1, max_list_size);
+            std::vector<data_value> list_data;
+            list_data.reserve(list_size);
+            for (size_t j = 0; j < list_size; j++) {
+                list_data.push_back(create_data_value());
+            }
+            test_data.push_back(std::move(list_data));
+        }
+        // Add an empty list to the test data
+        test_data.push_back({});
+
+        return test_data;
+    };
+
+    // Generate test data for lists and sets
+    const std::array<std::pair<data_type, const std::vector<std::vector<data_value>>>, 2> test_cases{{
+        // Test the collection with a data type that has fixed length : UUID (128 bits)
+        {uuid_type, generate_test_data(make_random_data_value_uuid)},
+        // Test the collection with a data type that has variable length : bytes
+        {bytes_type, generate_test_data(make_random_data_value_bytes)},
+    }};
+
+    // Generate vector of collections for each underlying type,
+    // with and without multi-cell enabled and run the tests on them.
+    for (const auto& [underlying_type, test_data] : test_cases) {
+        for (bool is_multi_cell : {false, true}) {
+            std::vector<data_value> collection_test_data;
+            collection_test_data.reserve(test_data.size());
+            auto collection_type = get_collection_type(underlying_type, is_multi_cell);
+            for (const auto& data : test_data) {
+                collection_test_data.emplace_back(make_collection_value(collection_type, data));
+            }
+
+            byte_comparable_test(std::move(collection_test_data));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_set) {
+    test_list_or_set(set_type_impl::get_instance, make_set_value);
+}
+
+BOOST_AUTO_TEST_CASE(test_list) {
+    test_list_or_set(list_type_impl::get_instance, make_list_value);
 }
 
 // Test Scylla's byte-comparable encoding compatibility with Cassandra's implementation by
