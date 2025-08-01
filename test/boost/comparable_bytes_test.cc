@@ -10,11 +10,15 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ipv4_address.hh>
 #include <seastar/util/lazy.hh>
+#include <vector>
 
 #include "bytes_ostream.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/sstable_test_env.hh"
+#include "types/list.hh"
+#include "types/map.hh"
+#include "types/set.hh"
 #include "types/types.hh"
 #include "types/comparable_bytes.hh"
 #include "utils/big_decimal.hh"
@@ -60,8 +64,8 @@ void byte_comparable_test(std::vector<data_value>&& test_data) {
         auto original_serialized_bytes = managed_bytes(value.serialize_nonnull());
         comparable_bytes comparable_bytes(*test_data_type, original_serialized_bytes);
         auto decoded_serialized_bytes = comparable_bytes.to_serialized_bytes(*test_data_type).value();
-        if (test_data_type == decimal_type) {
-            // The `decimal_type` requires special handling because its comparable byte representation
+        if (test_data_type == decimal_type || test_data_type->is_tuple()) {
+            // 1. The `decimal_type` requires special handling because its comparable byte representation
             // normalizes the scale and unscaled value. This means the serialized bytes after
             // decoding from comparable bytes might not be identical to the original serialized bytes,
             // despite them representing the same decimal value.
@@ -69,7 +73,9 @@ void byte_comparable_test(std::vector<data_value>&& test_data) {
             // are equivalent decimals but have different serialized forms. Comparable byte encoding
             // will normalize them. So, instead of directly comparing serialized bytes, compare the
             // deserialized decoded value against the original decimal value.
-            auto decoded_value = decimal_type->deserialize_value(managed_bytes_view(decoded_serialized_bytes));
+            // 2. When encoding `tuple_type`, any trailing nulls are trimmed, so the serialized bytes
+            // cannot be compared directly.
+            auto decoded_value = test_data_type->deserialize_value(managed_bytes_view(decoded_serialized_bytes));
             BOOST_REQUIRE_MESSAGE(value == decoded_value, seastar::value_of([&] () {
                 return fmt::format("comparable bytes encode/decode failed for value : {}", value);
             }));
@@ -515,6 +521,181 @@ BOOST_AUTO_TEST_CASE(test_inet) {
     }
 
     byte_comparable_test(std::move(test_data));
+}
+
+static data_value make_random_data_value_uuid() { return data_value(utils::make_random_uuid()); }
+static data_value make_random_data_value_bytes() {
+    constexpr size_t max_bytes_size = 128 * 1024; // 128 KB
+    return data_value(tests::random::get_bytes(tests::random::get_int<size_t>(1, max_bytes_size)));
+}
+
+extern void encode_component(const abstract_type& type, managed_bytes_view_opt serialized_bytes_view_opt, bytes_ostream& out);
+extern stop_iteration decode_component(const abstract_type& type, managed_bytes_view& comparable_bytes_view, bytes_ostream& out);
+BOOST_AUTO_TEST_CASE(test_encode_decode_component) {
+    // Verify NULL encode and decode works
+    bytes_ostream out;
+    data_value null_int = data_value::make_null(int32_type);
+    encode_component(*int32_type, managed_bytes_view_opt(null_int.serialize()), out);
+    auto comparable_bytes = std::move(out).to_managed_bytes();
+    auto comparable_bytes_view = managed_bytes_view(comparable_bytes);
+    // encoded bytes should just have a NEXT_COMPONENT_NULL marker
+    constexpr uint8_t NEXT_COMPONENT_NULL = 0x3E;
+    BOOST_REQUIRE_EQUAL(comparable_bytes_view.size(), sizeof(uint8_t));
+    BOOST_REQUIRE_EQUAL(comparable_bytes_view[0], NEXT_COMPONENT_NULL);
+    out.clear();
+    BOOST_REQUIRE_EQUAL(decode_component(*int32_type, comparable_bytes_view, out), stop_iteration::no);
+    auto decoded_bytes = std::move(out).to_managed_bytes();
+    auto decoded_bytes_view = managed_bytes_view(decoded_bytes);
+    // decoded bytes will have size as -1 for null components
+    BOOST_REQUIRE_EQUAL(decoded_bytes_view.size(), sizeof(int32_t));
+    BOOST_REQUIRE_EQUAL(read_simple<int32_t>(decoded_bytes_view), -1);
+
+    // Verify non-null encode and decode works
+    constexpr uint8_t NEXT_COMPONENT = 0x40;
+    for (const auto& test_value : {
+        make_random_data_value_uuid(), // data type with fixed length
+        make_random_data_value_bytes(), // data type with variable length
+    }) {
+        const auto& type = *test_value.type();
+        out.clear();
+        auto serialized_bytes = test_value.serialize_nonnull();
+        encode_component(type, managed_bytes_view_opt(serialized_bytes), out);
+        auto comparable_bytes = std::move(out).to_managed_bytes();
+        auto comparable_bytes_view = managed_bytes_view(comparable_bytes);
+        // encoded component should begin with a NEXT_COMPONENT marker
+        BOOST_REQUIRE_EQUAL(comparable_bytes_view[0], NEXT_COMPONENT);
+        out.clear();
+        BOOST_REQUIRE_EQUAL(decode_component(type, comparable_bytes_view, out), stop_iteration::no);
+        auto decoded_bytes = std::move(out).to_managed_bytes();
+        auto decoded_bytes_view = managed_bytes_view(decoded_bytes);
+        // decoded bytes should match the serialized form
+        BOOST_REQUIRE_EQUAL(read_simple<int32_t>(decoded_bytes_view), test_value.serialized_size());
+        BOOST_REQUIRE(decoded_bytes_view == managed_bytes_view(serialized_bytes));
+    }
+
+    // Check if decode handles terminator correctly
+    constexpr uint8_t TERMINATOR = 0x38;
+    out.write(bytes_view(reinterpret_cast<const signed char*>(&TERMINATOR), sizeof(TERMINATOR)));
+    comparable_bytes = std::move(out).to_managed_bytes();
+    comparable_bytes_view = managed_bytes_view(comparable_bytes);
+    out.clear();
+    BOOST_REQUIRE_EQUAL(decode_component(*int32_type, comparable_bytes_view, out), stop_iteration::yes);
+    BOOST_REQUIRE(out.empty());
+}
+
+// Common test method for lists and sets. Note that a set is expected to be sorted and unique, but it doesn't
+// matter during tests, as both lists and sets internally use the same underlying implementation based on vectors.
+static void test_list_or_set(const std::function<data_type(data_type, bool)>& get_collection_type,
+                             const std::function<data_value(data_type, std::vector<data_value>)>& make_collection_value) {
+    // Returns a vector of vectors of data_value, where each inner vector represents a collection of data_values.
+    auto generate_test_data = [] (const std::function<data_value()>& create_data_value) {
+        constexpr size_t test_data_size = 500, max_list_size = 25;
+        std::vector<std::vector<data_value>> test_data;
+        test_data.reserve(test_data_size + 1);
+        for (size_t i = 0; i < test_data_size; i++) {
+            size_t list_size = tests::random::get_int<size_t>(1, max_list_size);
+            std::vector<data_value> list_data;
+            list_data.reserve(list_size);
+            for (size_t j = 0; j < list_size; j++) {
+                list_data.push_back(create_data_value());
+            }
+            test_data.push_back(std::move(list_data));
+        }
+        // Add an empty list to the test data
+        test_data.push_back({});
+
+        return test_data;
+    };
+
+    // Generate test data for lists and sets
+    const std::array<std::pair<data_type, const std::vector<std::vector<data_value>>>, 2> test_cases{{
+        // Test the collection with a data type that has fixed length : UUID (128 bits)
+        {uuid_type, generate_test_data(make_random_data_value_uuid)},
+        // Test the collection with a data type that has variable length : bytes
+        {bytes_type, generate_test_data(make_random_data_value_bytes)},
+    }};
+
+    // Generate vector of collections for each underlying type,
+    // with and without multi-cell enabled and run the tests on them.
+    for (const auto& [underlying_type, test_data] : test_cases) {
+        for (bool is_multi_cell : {false, true}) {
+            std::vector<data_value> collection_test_data;
+            collection_test_data.reserve(test_data.size());
+            auto collection_type = get_collection_type(underlying_type, is_multi_cell);
+            for (const auto& data : test_data) {
+                collection_test_data.emplace_back(make_collection_value(collection_type, data));
+            }
+
+            byte_comparable_test(std::move(collection_test_data));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_set) {
+    test_list_or_set(set_type_impl::get_instance, make_set_value);
+}
+
+BOOST_AUTO_TEST_CASE(test_list) {
+    test_list_or_set(list_type_impl::get_instance, make_list_value);
+}
+
+BOOST_AUTO_TEST_CASE(test_map) {
+    // Generate the test data for a map with UUID keys and bytes values.
+    constexpr size_t test_data_size = 500, max_entries_per_map = 25;
+    std::vector<map_type_impl::native_type> map_test_data;
+    map_test_data.reserve(test_data_size + 1);
+    for (size_t i = 0; i < test_data_size; i++) {
+        map_type_impl::native_type test_item;
+        size_t num_entries = tests::random::get_int<size_t>(1, max_entries_per_map);
+        for (size_t j = 0; j < num_entries; j++) {
+            // Generate a random UUID and a random bytes value
+            test_item.emplace_back(make_random_data_value_uuid(), make_random_data_value_bytes());
+        }
+
+        // Add the map to the test data
+        map_test_data.emplace_back(test_item.begin(), test_item.end());
+    }
+
+    // Add an empty entry to the map
+    map_test_data.emplace_back();
+
+    for (bool is_multi_cell : {false, true}) {
+        const auto map_type = map_type_impl::get_instance(uuid_type, bytes_type, is_multi_cell);
+        std::vector<data_value> collection_test_data;
+        collection_test_data.reserve(map_test_data.size());
+        for (const auto& data : map_test_data) {
+            collection_test_data.emplace_back(make_map_value(map_type, data));
+        }
+
+        byte_comparable_test(std::move(collection_test_data));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_tuple) {
+    // Generate the test data for tuple with UUID and bytes types
+    constexpr size_t test_data_size = 1000;
+    std::vector<data_value> tuple_test_data;
+    tuple_test_data.reserve(test_data_size + 30 + 3);
+    const auto test_tuple_type = tuple_type_impl::get_instance({uuid_type, bytes_type});
+    for (size_t i = 0; i < test_data_size; i++) {
+        tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {make_random_data_value_uuid(), make_random_data_value_bytes()}));
+    }
+
+    // Include few duplicates in the test data
+    for (int i = 0; i < 10; i++) {
+        auto test_item = value_cast<tuple_type_impl::native_type>(
+            tuple_test_data.at(tests::random::get_int<size_t>(0, test_data_size - 1)));
+        tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {test_item.at(0), make_random_data_value_bytes()}));
+        tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {make_random_data_value_uuid(), test_item.at(1)}));
+        tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {test_item.at(0), test_item.at(1)}));
+    }
+
+    // Include tuples with nulls in the testdata
+    tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {make_random_data_value_uuid(), data_value::make_null(bytes_type)}));
+    tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {data_value::make_null(uuid_type), make_random_data_value_bytes()}));
+    tuple_test_data.emplace_back(make_tuple_value(test_tuple_type, {data_value::make_null(uuid_type), data_value::make_null(bytes_type)}));
+
+    byte_comparable_test(std::move(tuple_test_data));
 }
 
 // Test Scylla's byte-comparable encoding compatibility with Cassandra's implementation by
